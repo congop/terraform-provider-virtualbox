@@ -8,7 +8,15 @@ dist/
 /examples/terraform.tfstate.backup
 /examples/terraform-provider-virtualbox
 /examples/ubuntu-15.04.tar.xz
-/examples/*
+/examples/**
+!/examples/vm-user-data
+!/examples/vm-user-data/example.tf
+!/examples/vm-user-data/user_data
+!/examples/vm-cloud-init
+!/examples/vm-cloud-init/example.tf
+!/examples/vm-cloud-init/shareCloudInitFinalStatusAsVirtualBoxGuestProperties.sh
+!/examples/vm-cloud-init/variables.tf
+
 /provider/testdata/
 /terraform-provider-virtualbox*
 .idea/
@@ -17,3 +25,5 @@ dist/
 /examples/.python-version
 coverage.txt
 
+.vscode/
+my-notes.txt

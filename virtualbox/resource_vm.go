@@ -17,6 +17,7 @@ import (
 	"time"
 
 	humanize "github.com/dustin/go-humanize"
+	"github.com/google/uuid"
 	multierror "github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/terraform-plugin-sdk/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
@@ -40,6 +41,9 @@ func resourceVM() *schema.Resource {
 		Read:   resourceVMRead,
 		Update: resourceVMUpdate,
 		Delete: resourceVMDelete,
+		Importer: &schema.ResourceImporter{
+			State: importVM,
+		},
 
 		Schema: map[string]*schema.Schema{
 
@@ -76,9 +80,10 @@ func resourceVM() *schema.Resource {
 			},
 
 			"memory": {
-				Type:     schema.TypeString,
-				Optional: true,
-				Default:  "512mib",
+				Type:      schema.TypeString,
+				Optional:  true,
+				Default:   "512mib",
+				StateFunc: memoryInMibs,
 			},
 
 			"status": {
@@ -133,8 +138,9 @@ func resourceVM() *schema.Resource {
 						},
 
 						"mac_address": {
-							Type:     schema.TypeString,
-							Computed: true,
+							Type: schema.TypeString,
+							//Computed: true,
+							Optional: true,
 						},
 
 						"ipv4_address": {
@@ -145,6 +151,7 @@ func resourceVM() *schema.Resource {
 						"ipv4_address_available": {
 							Type:     schema.TypeString,
 							Computed: true,
+							//AtLeastOneOf: []string{"yes", "no", "cannot-detect-no-guest-add"},
 						},
 					},
 				},
@@ -157,8 +164,113 @@ func resourceVM() *schema.Resource {
 				Elem:        &schema.Schema{Type: schema.TypeString},
 				MaxItems:    4,
 			},
+
+			"cloud_init": {
+				Type:     schema.TypeList,
+				Optional: true,
+				MaxItems: 1,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"user_data": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+						"meta_data": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+						"network_config": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+					},
+				},
+			},
+
+			"uart": {
+				Type: schema.TypeList,
+				//Set:      uartsSchemaSetFunc,
+				Optional: true,
+				//StateFunc: EnsureMissingUARTsFillsAsOff,
+				Elem: &schema.Resource{
+
+					Schema: map[string]*schema.Schema{
+
+						"key": {
+							Type: schema.TypeString,
+							//ExactlyOneOf: []string{vbox.VBM},
+							Required: true,
+						},
+
+						"port": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+
+						"irq": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+
+						"type": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+
+						"mode": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+
+						"mode_data": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+					},
+				},
+			},
+
+			"creation_policy": {
+				Type:     schema.TypeList,
+				Optional: true,
+				MaxItems: 1,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+
+						"type": {
+							Type: schema.TypeString,
+							//ExactlyOneOf: []string{"cloud_init_done_by_vm_guestproperty"},
+							Required: true,
+						},
+
+						"timeout": {
+							Type:     schema.TypeString,
+							Default:  "PT3M",
+							Optional: true,
+						},
+
+						"spec": {
+							Type:     schema.TypeMap,
+							Optional: true,
+							Elem:     schema.TypeString,
+						},
+					},
+				},
+			},
 		},
 	}
+}
+
+func memoryInMibs(data interface{}) string {
+	dataStr, ok := data.(string)
+	if !ok {
+		return fmt.Sprint(data)
+	}
+	dataInBytes, err := humanize.ParseBytes(dataStr)
+	if err != nil {
+		return dataStr
+	}
+	return strings.ToLower(humanize.IBytes(dataInBytes))
 }
 
 func resourceVMExists(d *schema.ResourceData, meta interface{}) (bool, error) {
@@ -170,11 +282,20 @@ func resourceVMExists(d *schema.ResourceData, meta interface{}) (bool, error) {
 	case vbox.ErrMachineNotExist:
 		return false, nil
 	default:
-		return false, errLogf("Checking existance of VM '%s': %v", name, err)
+		return false, errLogf("Checking existance of VM '%s'|%v|%v: %v", name, d, meta, err)
 	}
 }
 
 var imageOpMutex sync.Mutex
+
+func vmGoldFolder(uuid string) (string, error) {
+	/* Get gold folder and machine folder */
+	usr, err := user.Current()
+	if err != nil {
+		return "", errors.Wrapf(err, " failed to get the current user: %v", err)
+	}
+	return filepath.Join(usr.HomeDir, ".terraform/virtualbox/gold", uuid), nil
+}
 
 func resourceVMCreate(d *schema.ResourceData, meta interface{}) error {
 	image := d.Get("image").(string)
@@ -198,8 +319,17 @@ func resourceVMCreate(d *schema.ResourceData, meta interface{}) error {
 	if err != nil {
 		return errLogf("Get the current user: %v", err)
 	}
-	goldFolder := filepath.Join(usr.HomeDir, ".terraform/virtualbox/gold")
-	machineFolder := filepath.Join(usr.HomeDir, ".terraform/virtualbox/machine")
+	uuid, err := uuid.NewRandom()
+	if err != nil {
+		return errors.Wrap(err, "failed to get NewRandom")
+	}
+	// randomizing the folders to avoid collission
+	// - gold image from image resource colliding because the image name is the same
+	// - machine resources colliding because the vm name are equal.
+	//   e.g. same vm name in  different terraform projects
+	goldFolder := filepath.Join(usr.HomeDir, ".terraform/virtualbox/gold", uuid.String())
+	machineFolder := filepath.Join(usr.HomeDir, ".terraform/virtualbox/machine", uuid.String())
+	vbox.Debug("goldFolder=%s, machineFolder=%s", goldFolder, machineFolder)
 	os.MkdirAll(goldFolder, 0740)
 	os.MkdirAll(machineFolder, 0740)
 
@@ -227,7 +357,7 @@ func resourceVMCreate(d *schema.ResourceData, meta interface{}) error {
 
 	// Create VM instance
 	name := d.Get("name").(string)
-	vm, err := vbox.CreateMachine(name, machineFolder)
+	vm, err := vbox.CreateMachine(uuid.String(), name, machineFolder)
 	if err != nil {
 		return errLogf("Create virtualbox VM %s: %v\n", name, err)
 	}
@@ -312,6 +442,10 @@ func resourceVMCreate(d *schema.ResourceData, meta interface{}) error {
 		}
 	}
 
+	if err := AttachCloudInitUserData(d, meta, vm, uint(len(vmDisks)+len(opticalDisks))); nil != err {
+		return errors.Wrap(err, "Error Attaching Cloud Init User Data")
+	}
+
 	// Setup VM general properties
 	if err := tfToVbox(d, vm); err != nil {
 		return errLogf("Converting Terraform data to VM properties: %v", err)
@@ -328,6 +462,10 @@ func resourceVMCreate(d *schema.ResourceData, meta interface{}) error {
 	// Assign VM ID
 	log.Printf("[DEBUG] Resource ID: %s\n", vm.UUID)
 	d.SetId(vm.UUID)
+
+	if err := waitUntilAnyUnmetCreationPolicyOrAllTimeout(d, vm, meta); err != nil {
+		return errLogf("Wait VM Creation Policy: %v", err)
+	}
 
 	if err := waitUntilVMIsReady(d, vm, meta); err != nil {
 		return errLogf("Wait VM until ready: %v", err)
@@ -389,6 +527,10 @@ func resourceVMRead(d *schema.ResourceData, meta interface{}) error {
 		return errLogf("can't convert vbox network to terraform data: %v", err)
 	}
 
+	if err = uartVboxToTf(vm, d); err != nil {
+		return errLogf("can't convert vbox uarts to terraform data: %v", err)
+	}
+
 	/* Set connection info to first non NAT IPv4 address */
 	for i, nic := range vm.NICs {
 		if nic.Network == vbox.NICNetNAT {
@@ -411,7 +553,7 @@ func resourceVMRead(d *schema.ResourceData, meta interface{}) error {
 	}
 
 	d.Set("boot_order", vm.BootOrder)
-
+	//TODO add read cloud_init-user data
 	return nil
 }
 
@@ -459,6 +601,11 @@ func resourceVMDelete(d *schema.ResourceData, meta interface{}) error {
 	if err := vm.Delete(); err != nil {
 		return errLogf("unable to remove the VM: %v", err)
 	}
+
+	deleteVMStorage(vm)
+
+	//TODO delete gold folder # even vboxmanage delete medium?
+	//TODO delete base folder, iso is still there; does it need some vboxmanage?
 	return nil
 }
 
@@ -471,7 +618,7 @@ func waitUntilVMIsReady(d *schema.ResourceData, vm *vbox.Machine, meta interface
 
 		key := fmt.Sprintf("network_adapter.%d.ipv4_address_available", i)
 		if _, err := waitForVMAttribute(
-			d, []string{"yes"}, []string{"no"}, key, meta, 3*time.Second, 3*time.Second,
+			d, []string{"yes", "cannot-detect-no-guest-add"}, []string{"no"}, key, meta, 3*time.Second, 3*time.Second,
 		); err != nil {
 			return errors.Wrapf(err, "waiting for VM (%s) to become ready", d.Get("name"))
 		}
@@ -482,6 +629,7 @@ func waitUntilVMIsReady(d *schema.ResourceData, vm *vbox.Machine, meta interface
 
 func tfToVbox(d *schema.ResourceData, vm *vbox.Machine) error {
 	var err error
+	multierr := new(multierror.Error)
 
 	vm.OSType = "Linux_64"
 	vm.CPUs = uint(d.Get("cpus").(int))
@@ -492,19 +640,28 @@ func tfToVbox(d *schema.ResourceData, vm *vbox.Machine) error {
 	vm.Memory = uint(bytes / humanize.MiByte) // VirtualBox expect memory to be in MiB units
 
 	vm.VRAM = 20 // Always 10MiB for vram
-	vm.Flag = vbox.F_acpi | vbox.F_ioapic | vbox.F_rtcuseutc | vbox.F_pae |
-		vbox.F_hwvirtex | vbox.F_nestedpaging | vbox.F_largepages | vbox.F_longmode |
-		vbox.F_vtxvpid | vbox.F_vtxux
+	vm.Flag = vbox.ACPI | vbox.IOAPIC | vbox.RTCUSEUTC | vbox.PAE |
+		vbox.HWVIRTEX | vbox.NESTEDPAGING | vbox.LARGEPAGES | vbox.LONGMODE |
+		vbox.VTXVPID | vbox.VTXUX
 	vm.NICs, err = netTfToVbox(d)
 	userData := d.Get("user_data").(string)
+	multierror.Append(multierr, err)
 	if userData != "" {
 		err = vm.SetExtraData("user_data", userData)
+		multierr = multierror.Append(multierr, err)
 	}
 	vm.BootOrder = defaultBootOrder
 	for i, bootDev := range d.Get("boot_order").([]interface{}) {
 		vm.BootOrder[i] = bootDev.(string)
 	}
-	return err
+
+	if pUARTs, err := uartTfToVbox(d); nil != err {
+		multierr = multierror.Append(multierr, err)
+	} else {
+		vm.UARTs = *pUARTs
+	}
+
+	return multierr.ErrorOrNil()
 }
 
 func netTfToVbox(d *schema.ResourceData) ([]vbox.NIC, error) {
@@ -521,7 +678,7 @@ func netTfToVbox(d *schema.ResourceData) ([]vbox.NIC, error) {
 		case "generic":
 			return vbox.NICNetGeneric, nil
 		default:
-			return "", fmt.Errorf("Invalid virtual network adapter type: %s", attr)
+			return "", fmt.Errorf("invalid virtual network adapter type: %s", attr)
 		}
 	}
 
@@ -538,7 +695,7 @@ func netTfToVbox(d *schema.ResourceData) ([]vbox.NIC, error) {
 		case "IntelPro1000MTServer":
 			return vbox.IntelPro1000MTServer, nil
 		default:
-			return "", fmt.Errorf("Invalid virtual network device: %s", attr)
+			return "", fmt.Errorf("invalid virtual network device: %s", attr)
 		}
 	}
 
@@ -556,6 +713,9 @@ func netTfToVbox(d *schema.ResourceData) ([]vbox.NIC, error) {
 		}
 		if attr, ok := d.Get(prefix + "device").(string); ok && attr != "" {
 			adapter.Hardware, err = tfToVboxNetDevice(attr)
+		}
+		if attr, ok := d.Get(prefix + "mac_address").(string); ok && attr != "" {
+			adapter.MacAddr = attr
 		}
 		/* 'Hostonly' and 'bridged' network need property 'host_interface' been set */
 		if adapter.Network == vbox.NICNetHostonly || adapter.Network == vbox.NICNetBridged {
@@ -584,17 +744,29 @@ func netTfToVbox(d *schema.ResourceData) ([]vbox.NIC, error) {
 
 // countRuntimeNics will return the number of NICs found after VM successfully started.
 func countRuntimeNICs(vm *vbox.Machine) (int, error) {
-	count, err := vm.GetGuestProperty("/VirtualBox/GuestInfo/Net/Count")
+	count, err := vbox.GetGuestProperty(vm.Name, "/VirtualBox/GuestInfo/Net/Count")
 
 	if err != nil {
 		return 0, err
 	}
 
-	if count == nil {
+	if count == "" {
 		return 0, nil
 	}
 
-	return strconv.Atoi(*count)
+	return strconv.Atoi(count)
+}
+
+// isGuestAdditionIstalled returns true if guess addition has been detected, false otherwise.
+// Note that false is also return if mean used for the detection returns an error.
+//
+func canDetectGuestAdditionIstallion(vm *vbox.Machine) bool {
+	version, err := vbox.GetGuestProperty(vm.Name, "/VirtualBox/GuestAdd/Version")
+	if nil != err {
+		log.Printf("Error getting guestproperty(/VirtualBox/GuestAdd/Version):%v", err)
+		return false
+	}
+	return version != ""
 }
 
 func netVboxToTf(vm *vbox.Machine, d *schema.ResourceData) error {
@@ -631,9 +803,10 @@ func netVboxToTf(vm *vbox.Machine, d *schema.ResourceData) error {
 			return ""
 		}
 	}
-
+	canDetectGuestAdditionIstallion := canDetectGuestAdditionIstallion(vm)
+	log.Printf("canDetectGuestAdditionIstallion form vm:%s: %v", vm.Name, canDetectGuestAdditionIstallion)
 	/* Collect NIC data from guest OS, available only when VM is running */
-	if vm.State == vbox.Running {
+	if (vm.State == vbox.Running) && canDetectGuestAdditionIstallion {
 		nicCount, err := countRuntimeNICs(vm)
 		if err != nil {
 			return err
@@ -656,38 +829,38 @@ func netVboxToTf(vm *vbox.Machine, d *schema.ResourceData) error {
 			var osNic OsNicData
 
 			/* NIC MAC address */
-			macAddr, err := vm.GetGuestProperty(fmt.Sprintf("/VirtualBox/GuestInfo/Net/%d/MAC", i))
+			macAddr, err := vbox.GetGuestProperty(vm.Name, fmt.Sprintf("/VirtualBox/GuestInfo/Net/%d/MAC", i))
 			if err != nil {
 				errs = append(errs, err)
 				continue
 			}
-			if macAddr == nil || *macAddr == "" {
+			if macAddr == "" {
 				return nil
 			}
 
 			/* NIC status */
-			status, err := vm.GetGuestProperty(fmt.Sprintf("/VirtualBox/GuestInfo/Net/%d/Status", i))
+			status, err := vbox.GetGuestProperty(vm.Name, fmt.Sprintf("/VirtualBox/GuestInfo/Net/%d/Status", i))
 			if err != nil {
 				errs = append(errs, err)
 				continue
 			}
-			if status == nil || *status == "" {
+			if status == "" {
 				return nil
 			}
-			osNic.status = strings.ToLower(*status)
+			osNic.status = strings.ToLower(status)
 
 			/* NIC ipv4 address */
-			ipv4Addr, err := vm.GetGuestProperty(fmt.Sprintf("/VirtualBox/GuestInfo/Net/%d/V4/IP", i))
+			ipv4Addr, err := vbox.GetGuestProperty(vm.Name, fmt.Sprintf("/VirtualBox/GuestInfo/Net/%d/V4/IP", i))
 			if err != nil {
 				errs = append(errs, err)
 				continue
 			}
-			if ipv4Addr == nil || *ipv4Addr == "" {
+			if ipv4Addr == "" {
 				return nil
 			}
-			osNic.ipv4Addr = *ipv4Addr
+			osNic.ipv4Addr = ipv4Addr
 
-			osNicMap[*macAddr] = osNic
+			osNicMap[macAddr] = osNic
 		}
 
 		if len(errs) > 0 {
@@ -703,7 +876,7 @@ func netVboxToTf(vm *vbox.Machine, d *schema.ResourceData) error {
 			out["type"] = vboxToTfNetworkType(nic.Network)
 			out["device"] = vboxToTfVdevice(nic.Hardware)
 			out["host_interface"] = nic.HostInterface
-			out["mac_address"] = nic.MacAddr
+			out["mac_address"] = strings.ToLower(nic.MacAddr)
 
 			osNic, ok := osNicMap[nic.MacAddr]
 			if !ok {
@@ -721,6 +894,26 @@ func netVboxToTf(vm *vbox.Machine, d *schema.ResourceData) error {
 		}
 
 		d.Set("network_adapter", nics)
+	} else if vm.State == vbox.Running && !canDetectGuestAdditionIstallion {
+		// Mark compuped data as cannot-detect-no-guest-add
+		nics := make([]map[string]interface{}, 0, 1)
+
+		for _, nic := range vm.NICs {
+			out := make(map[string]interface{})
+
+			out["type"] = vboxToTfNetworkType(nic.Network)
+			out["device"] = vboxToTfVdevice(nic.Hardware)
+			out["host_interface"] = nic.HostInterface
+			out["mac_address"] = strings.ToLower(nic.MacAddr)
+
+			out["status"] = "cannot-detect-no-guest-add"
+			out["ipv4_address"] = ""
+			out["ipv4_address_available"] = "cannot-detect-no-guest-add"
+
+			nics = append(nics, out)
+		}
+
+		d.Set("network_adapter", nics)
 	} else {
 		// Assign NIC property to vbox structure and Terraform
 		nics := make([]map[string]interface{}, 0, 1)
@@ -731,7 +924,7 @@ func netVboxToTf(vm *vbox.Machine, d *schema.ResourceData) error {
 			out["type"] = vboxToTfNetworkType(nic.Network)
 			out["device"] = vboxToTfVdevice(nic.Hardware)
 			out["host_interface"] = nic.HostInterface
-			out["mac_address"] = nic.MacAddr
+			out["mac_address"] = strings.ToLower(nic.MacAddr)
 
 			out["status"] = "down"
 			out["ipv4_address"] = ""
@@ -742,6 +935,8 @@ func netVboxToTf(vm *vbox.Machine, d *schema.ResourceData) error {
 
 		d.Set("network_adapter", nics)
 	}
+
+	//TODO Add UART features
 
 	return nil
 }
@@ -807,6 +1002,14 @@ func newVMStateRefreshFunc(
 
 		return nil, "", nil
 	}
+}
+
+func importVM(dHoldingID *schema.ResourceData, meta interface{}) ([]*schema.ResourceData, error) {
+	if err := resourceVMRead(dHoldingID, meta); err != nil {
+		return nil, errors.Wrapf(err, "Error importing resource:%v", dHoldingID)
+	}
+
+	return []*schema.ResourceData{dHoldingID}, nil
 }
 
 func fetchIfRemote(u *url.URL) (string, error) {

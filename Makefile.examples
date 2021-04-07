@@ -1,0 +1,51 @@
+SHELL = /bin/bash
+
+PJT_MKFILE_ABSPATH := $(abspath $(lastword $(MAKEFILE_LIST)))
+PJT_MKFILE_ABSDIR := $(strip $(patsubst %/,%,$(dir $(PJT_MKFILE_ABSPATH))) )
+EXPL_DIR := $(PJT_MKFILE_ABSDIR)/examples/vm-cloud-init
+OVA_PATH=$(EXPL_DIR)/ubuntu-20.04-server-cloudimg-amd64.ova
+
+IMG=https://cloud-images.ubuntu.com/releases/focal/release/ubuntu-20.04-server-cloudimg-amd64.ova
+
+check-ova-availability:
+	@if [ ! -f $(OVA_PATH) ]; then \
+		echo ""; \
+		echo "please download IMG( $(IMG) )"; \
+		echo "    to $(EXPL_DIR)/"; \
+		echo ""; \
+		exit 1; \
+	fi; \
+
+vm-cloud-init-build-and-init: check-ova-availability
+	cd $(PJT_MKFILE_ABSDIR) && \
+	go build &&  \
+	cp terraform-provider-virtualbox examples/vm-cloud-init && \
+	cd examples/vm-cloud-init && \
+	TF_LOG=TRACE TF_VAR_img_path_or_url=$(OVA_PATH) terraform init -reconfigure \
+	;
+#-upgrade
+
+terraform-plan: check-ova-availability
+	cd $(EXPL_DIR) && \
+	TF_LOG=TRACE TF_VAR_img_path_or_url=$(OVA_PATH) terraform plan
+
+terraform-apply: check-ova-availability
+	cd $(EXPL_DIR) && \
+	TF_LOG=TRACE TF_VAR_img_path_or_url=$(OVA_PATH) terraform apply
+
+terraform-destroy: check-ova-availability
+	cd $(EXPL_DIR) && \
+	TF_LOG=TRACE TF_VAR_img_path_or_url=$(OVA_PATH) terraform destroy
+
+
+terraform-x: check-ova-availability
+	@if [ -z "$(MK_TF_CMD)" ]; then \
+		echo -e "\n\n"; \
+		echo -e "Please provide MK_TF_CMD!"; \
+		echo -e "usage: make terraform-x MK_TF_CMD='xxx'"; \
+		echo -e "exmple: make terraform-x MK_TF_CMD='plan --help'"; \
+		echo -e "\n\n"; \
+		exit 1; \
+	fi;
+	cd $(EXPL_DIR) && \
+	TF_LOG=TRACE TF_VAR_img_path_or_url=$(OVA_PATH) terraform $(MK_TF_CMD)
